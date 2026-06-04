@@ -1,694 +1,544 @@
 """
-XAU/USD HIGH-ACCURACY ALERT BOT v4
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Accuracy fixes:
-  ✅ Multi-TF confluence (5+ TF must agree)
-  ✅ EMA trend filter  (no counter-trend trades)
-  ✅ ATR-based SL/TP  (volatility-adjusted, not arbitrary)
-  ✅ RSI divergence filter
-  ✅ Minimum R:R 1.5 gate  (signals with R:R < 1.5 = NEUTRAL)
-  ✅ Trend strength 0–10 score
-  ✅ Market structure: Higher High / Lower Low detection
-  ✅ Session quality filter (signals stronger in KZ overlap)
-  ✅ Volume confirmation (relative volume spike check)
+GOLD SCALPING PRO BOT v5
+- Balanced signal scoring (not too tight, not too loose)
+- Full details har 1 ghante mein
+- ICT + SMC + Multi-indicator confluence
+- ATR-based dynamic SL/TP
+- DXY correlation
+- No double firing
 """
-import os, datetime, requests, ephem
+import os, datetime, requests, ephem, time
 import yfinance as yf
 import pandas as pd
-import numpy as np
- 
+
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN",   "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN",  "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID","")
 WA_PHONE         = os.environ.get("WA_PHONE",  "")
 WA_APIKEY        = os.environ.get("WA_APIKEY", "")
-SYMBOL           = "GC=F"
 ALERT_MODE       = os.environ.get("ALERT_MODE", "full")
 IST              = datetime.timedelta(hours=5, minutes=30)
- 
-MIN_RR           = 1.5   # Minimum R:R — trades below this = NEUTRAL
-MIN_TF_AGREE     = 5     # Out of 8 TFs must agree for strong signal
-ATR_SL_MULT      = 1.5   # SL = ATR * this multiplier
-ATR_TP_MULT      = 2.5   # TP = ATR * this multiplier
- 
+
+PAIRS = {
+    "XAU/USD": "GC=F",
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "US30":    "YM=F",
+    "NAS100":  "NQ=F",
+    "OIL":     "CL=F",
+    "BTC/USD": "BTC-USD",
+    "DXY":     "DX-Y.NYB",
+}
+
 # ── TIME ──────────────────────────────────────────────────────────────────────
-def utcnow():  return datetime.datetime.utcnow()
-def istnow():  return utcnow() + IST
+def utcnow(): return datetime.datetime.utcnow()
+def istnow(): return utcnow() + IST
 def ist_str(): return istnow().strftime("%d %b %Y  %I:%M %p IST")
-def utc_h():
-    n = utcnow(); return n.hour + n.minute / 60
- 
+def utc_h():   n=utcnow(); return n.hour + n.minute/60
+
 # ── SENDERS ───────────────────────────────────────────────────────────────────
 def send_telegram(msg):
     if not TELEGRAM_TOKEN: return
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg,
-                  "parse_mode": "HTML", "disable_web_page_preview": True},
-            timeout=15)
-        print("✅ TG sent" if r.status_code == 200 else f"⚠️ TG {r.text[:80]}")
-    except Exception as e:
-        print(f"❌ TG: {e}")
- 
+    for part in [msg[i:i+4000] for i in range(0,len(msg),4000)]:
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id":TELEGRAM_CHAT_ID,"text":part,
+                      "parse_mode":"HTML","disable_web_page_preview":True},
+                timeout=15)
+            print("✅ TG" if r.status_code==200 else f"⚠️ {r.text[:60]}")
+            time.sleep(0.5)
+        except Exception as e: print(f"❌ TG: {e}")
+
 def send_whatsapp(msg):
     if not WA_PHONE or not WA_APIKEY: return
-    import re; clean = re.sub(r"<[^>]+>", "", msg)
+    import re
+    clean = re.sub(r"<[^>]+>","",msg)[:1500]
     try:
-        r = requests.get("https://api.callmebot.com/whatsapp.php",
-                         params={"phone": WA_PHONE, "text": clean, "apikey": WA_APIKEY},
-                         timeout=15)
-        print("✅ WA sent" if r.status_code == 200 else f"⚠️ WA {r.text[:80]}")
+        requests.get("https://api.callmebot.com/whatsapp.php",
+            params={"phone":WA_PHONE,"text":clean,"apikey":WA_APIKEY},timeout=15)
+    except: pass
+
+def send_all(msg): send_telegram(msg); send_whatsapp(msg)
+
+# ── DATA ──────────────────────────────────────────────────────────────────────
+def get_data(symbol="GC=F"):
+    try:
+        t   = yf.Ticker(symbol)
+        d1  = t.history(period="10d",  interval="1d")
+        h4  = t.history(period="10d",  interval="4h")
+        h1  = t.history(period="5d",   interval="1h")
+        m15 = t.history(period="5d",   interval="15m")
+        m5  = t.history(period="2d",   interval="5m")
+        w1  = t.history(period="3mo",  interval="1wk")
+        mo1 = t.history(period="12mo", interval="1mo")
+        if d1.empty: return None
+        tod  = d1.iloc[-1]
+        prev = d1.iloc[-2] if len(d1)>1 else tod
+        return dict(
+            price   = round(float(tod["Close"]),2),
+            day_h   = round(float(tod["High"]),2),
+            day_l   = round(float(tod["Low"]),2),
+            day_o   = round(float(tod["Open"]),2),
+            prev_h  = round(float(prev["High"]),2),
+            prev_l  = round(float(prev["Low"]),2),
+            prev_c  = round(float(prev["Close"]),2),
+            week_h  = round(float(w1["High"].max()),2)  if not w1.empty  else 0,
+            week_l  = round(float(w1["Low"].min()),2)   if not w1.empty  else 0,
+            month_h = round(float(mo1["High"].max()),2) if not mo1.empty else 0,
+            month_l = round(float(mo1["Low"].min()),2)  if not mo1.empty else 0,
+            d1=d1, h4=h4, h1=h1, m15=m15, m5=m5,
+        )
     except Exception as e:
-        print(f"❌ WA: {e}")
- 
-def send_all(msg):
-    send_telegram(msg)
-    send_whatsapp(msg)
- 
-# ── PRICE DATA ────────────────────────────────────────────────────────────────
-def get_data():
-    t = yf.Ticker(SYMBOL)
-    d = {}
-    d["m5"]  = t.history(period="3d",   interval="5m")
-    d["m15"] = t.history(period="5d",   interval="15m")
-    d["m30"] = t.history(period="5d",   interval="30m")
-    d["h1"]  = t.history(period="7d",   interval="1h")
-    d["h2"]  = t.history(period="10d",  interval="2h")
-    d["h4"]  = t.history(period="14d",  interval="4h")
-    d["d1"]  = t.history(period="30d",  interval="1d")
-    d["w1"]  = t.history(period="52wk", interval="1wk")
-    d["mo1"] = t.history(period="24mo", interval="1mo")
- 
-    if d["d1"].empty or len(d["d1"]) < 2:
-        return None
- 
-    today = d["d1"].iloc[-1]
-    prev  = d["d1"].iloc[-2]
- 
-    d["price"]   = round(float(today["Close"]), 2)
-    d["day_h"]   = round(float(today["High"]),  2)
-    d["day_l"]   = round(float(today["Low"]),   2)
-    d["day_o"]   = round(float(today["Open"]),  2)
-    d["prev_h"]  = round(float(prev["High"]),   2)
-    d["prev_l"]  = round(float(prev["Low"]),    2)
-    d["prev_c"]  = round(float(prev["Close"]),  2)
-    d["week_h"]  = round(float(d["w1"]["High"].max()),  2) if not d["w1"].empty  else 0
-    d["week_l"]  = round(float(d["w1"]["Low"].min()),   2) if not d["w1"].empty  else 0
-    d["month_h"] = round(float(d["mo1"]["High"].max()), 2) if not d["mo1"].empty else 0
-    d["month_l"] = round(float(d["mo1"]["Low"].min()),  2) if not d["mo1"].empty else 0
- 
-    return d
- 
-# ── TECHNICAL INDICATORS ──────────────────────────────────────────────────────
-def calc_ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
- 
-def calc_rsi(df, period=14):
-    if df is None or len(df) < period + 1:
-        return 50.0
-    delta = df["Close"].diff()
-    gain  = delta.clip(lower=0).rolling(period).mean()
-    loss  = (-delta.clip(upper=0)).rolling(period).mean()
-    rs    = gain / loss
-    return round(float((100 - 100 / (1 + rs)).iloc[-1]), 1)
- 
-def calc_atr(df, period=14):
-    """Average True Range — real volatility measure"""
-    if df is None or len(df) < period + 1:
-        return None
-    high  = df["High"]
-    low   = df["Low"]
-    close = df["Close"].shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - close).abs(),
-        (low  - close).abs()
-    ], axis=1).max(axis=1)
-    return float(tr.rolling(period).mean().iloc[-1])
- 
-def calc_macd(df):
-    """Returns (macd_line, signal_line, histogram)"""
-    if df is None or len(df) < 35:
-        return None, None, None
-    close  = df["Close"]
-    ema12  = calc_ema(close, 12).iloc[-1]
-    ema26  = calc_ema(close, 26).iloc[-1]
-    macd   = ema12 - ema26
-    # Signal = EMA9 of MACD
-    macd_series = calc_ema(close, 12) - calc_ema(close, 26)
-    signal = macd_series.ewm(span=9, adjust=False).mean().iloc[-1]
-    hist   = macd - signal
-    return round(macd, 2), round(signal, 2), round(hist, 2)
- 
-def calc_bbands(df, period=20, std=2.0):
-    """Bollinger Bands — returns (upper, mid, lower)"""
-    if df is None or len(df) < period:
-        return None, None, None
-    close = df["Close"]
-    mid   = close.rolling(period).mean().iloc[-1]
-    sd    = close.rolling(period).std().iloc[-1]
-    return round(mid + std*sd, 2), round(mid, 2), round(mid - std*sd, 2)
- 
-def vol_ratio(df, period=20):
-    """Current volume vs average — >1.5 = spike"""
-    if df is None or len(df) < period or "Volume" not in df.columns:
-        return 1.0
-    avg = float(df["Volume"].rolling(period).mean().iloc[-1])
-    cur = float(df["Volume"].iloc[-1])
-    if avg == 0: return 1.0
-    return round(cur / avg, 2)
- 
-def detect_structure(df):
-    """
-    Market structure: Higher High / Higher Low = uptrend
-                      Lower High / Lower Low   = downtrend
-    Uses last 3 swing highs and lows from H4
-    """
-    if df is None or len(df) < 10:
-        return "Unknown"
-    highs = df["High"].values[-10:]
-    lows  = df["Low"].values[-10:]
-    # Simple: compare last 3 periods
-    h = [highs[-8], highs[-5], highs[-2]]
-    l = [lows[-8],  lows[-5],  lows[-2]]
-    if h[2] > h[1] > h[0] and l[2] > l[1] > l[0]:
-        return "HH/HL 📈"   # Uptrend structure
-    if h[2] < h[1] < h[0] and l[2] < l[1] < l[0]:
-        return "LH/LL 📉"   # Downtrend structure
-    if h[2] > h[0] and l[2] < l[0]:
-        return "Expanding ↔"
-    return "Ranging ↔"
- 
-# ── PIVOT POINTS ─────────────────────────────────────────────────────────────
-def calc_pivots(h, l, c):
-    pp = round((h + l + c) / 3, 2)
-    return dict(
-        PP=pp,
-        R1=round(2*pp - l,    2), R2=round(pp + (h-l),      2), R3=round(h + 2*(pp-l), 2),
-        S1=round(2*pp - h,    2), S2=round(pp - (h-l),      2), S3=round(l - 2*(h-pp), 2)
-    )
- 
-# ── MULTI-TF TREND ENGINE ────────────────────────────────────────────────────
-def tf_trend(df):
-    """
-    Returns: +1 Bullish, -1 Bearish, 0 Neutral
-    Condition: price > EMA20 > EMA50 → Bull
-               price < EMA20 < EMA50 → Bear
-    """
-    if df is None or len(df) < 21:
-        return 0
-    c   = df["Close"]
-    e20 = calc_ema(c, 20).iloc[-1]
-    e50 = calc_ema(c, 50).iloc[-1] if len(c) >= 50 else e20
-    p   = float(c.iloc[-1])
-    if p > e20 and e20 > e50:
-        return 1
-    if p < e20 and e20 < e50:
-        return -1
-    return 0
- 
+        print(f"Data error: {e}"); return None
+
+# ── INDICATORS ────────────────────────────────────────────────────────────────
+def ema(s,p): return s.ewm(span=p,adjust=False).mean()
+
+def rsi_val(df, p=14):
+    if df is None or len(df)<p+1: return 50.0
+    d=df["Close"].diff()
+    g=d.clip(lower=0).rolling(p).mean()
+    l=(-d.clip(upper=0)).rolling(p).mean()
+    return round(float((100-100/(1+g/l)).iloc[-1]),1)
+
+def macd_signal(df):
+    if df is None or len(df)<26: return "⚪", 0
+    c=df["Close"]
+    hist = ema(c,12).iloc[-1] - ema(c,26).iloc[-1]
+    prev_hist = ema(c,12).iloc[-2] - ema(c,26).iloc[-2] if len(c)>2 else hist
+    if hist>0 and hist>prev_hist: return "📈 Bull Cross", round(hist,3)
+    if hist>0:                    return "📈 Bull",       round(hist,3)
+    if hist<0 and hist<prev_hist: return "📉 Bear Cross", round(hist,3)
+    return "📉 Bear", round(hist,3)
+
+def atr_val(df, p=14):
+    if df is None or len(df)<p+1: return 5.0
+    h=df["High"]; l=df["Low"]; c=df["Close"]
+    tr=pd.concat([h-l,(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
+    return round(float(tr.rolling(p).mean().iloc[-1]),2)
+
+def bollinger_pos(df, p=20):
+    """Returns: 'above upper', 'below lower', 'near mid', 'upper half', 'lower half'"""
+    if df is None or len(df)<p: return "unknown", 0, 0, 0
+    c=df["Close"]
+    mid=c.rolling(p).mean().iloc[-1]
+    std=c.rolling(p).std().iloc[-1]
+    upper=mid+2*std; lower=mid-2*std
+    price=float(c.iloc[-1])
+    if price>upper:   pos="🔴 Above upper BB"
+    elif price<lower: pos="🟢 Below lower BB (oversold)"
+    elif price>mid:   pos="🟡 Upper half BB"
+    else:             pos="🟡 Lower half BB"
+    return pos, round(lower,2), round(mid,2), round(upper,2)
+
+def stoch_rsi_val(df, p=14):
+    if df is None or len(df)<p*2: return 50.0
+    c=df["Close"].diff()
+    g=c.clip(lower=0).rolling(p).mean()
+    l=(-c.clip(upper=0)).rolling(p).mean()
+    r=100-(100/(1+g/l))
+    lo=r.rolling(p).min(); hi=r.rolling(p).max()
+    s=100*(r-lo)/(hi-lo+1e-9)
+    return round(float(s.iloc[-1]),1)
+
+# ── SMART MONEY ───────────────────────────────────────────────────────────────
+def market_structure(df):
+    if df is None or len(df)<10: return "⚪ Unknown", 0
+    h=df["High"].rolling(3).max(); l=df["Low"].rolling(3).min()
+    if len(h)<4: return "⚪ Unknown", 0
+    hh = h.iloc[-1]>h.iloc[-3]; hl = l.iloc[-1]>l.iloc[-3]
+    lh = h.iloc[-1]<h.iloc[-3]; ll = l.iloc[-1]<l.iloc[-3]
+    if hh and hl:  return "📈 HH+HL (Bullish)", 1
+    if lh and ll:  return "📉 LH+LL (Bearish)", -1
+    return "🔄 Ranging", 0
+
+def find_ob(df):
+    """Simple Order Block finder"""
+    if df is None or len(df)<5: return None, None
+    bull_ob=None; bear_ob=None
+    for i in range(len(df)-6, len(df)-1):
+        try:
+            c=df.iloc[i]; n=df.iloc[i+1]
+            if c["Close"]<c["Open"] and n["Close"]>n["Open"]:
+                bull_ob=round(float(c["Low"]),2)
+            if c["Close"]>c["Open"] and n["Close"]<n["Open"]:
+                bear_ob=round(float(c["High"]),2)
+        except: continue
+    return bull_ob, bear_ob
+
+# ── PIVOTS ────────────────────────────────────────────────────────────────────
+def calc_pivots(h,l,c):
+    pp=round((h+l+c)/3,2)
+    return dict(PP=pp,
+        R1=round(2*pp-l,2),R2=round(pp+(h-l),2),R3=round(h+2*(pp-l),2),
+        S1=round(2*pp-h,2),S2=round(pp-(h-l),2),S3=round(l-2*(h-pp),2))
+
+# ── TREND ─────────────────────────────────────────────────────────────────────
+def trend(df, price, prev_c):
+    if df is None or len(df)<20:
+        return "🟢 Bull" if price>prev_c else "🔴 Bear"
+    c=df["Close"]
+    e21=ema(c,21).iloc[-1]; e50=ema(c,50).iloc[-1] if len(c)>=50 else e21
+    p=float(c.iloc[-1])
+    if p>e21 and e21>e50: return "🟢 Bull"
+    if p<e21 and e21<e50: return "🔴 Bear"
+    if p>e21: return "🟡 Weak Bull"
+    if p<e21: return "🟡 Weak Bear"
+    return "🟡 Side"
+
 def all_trends(d):
-    tfs = [
-        ("5m",   d["m5"]),
-        ("15m",  d["m15"]),
-        ("30m",  d["m30"]),
-        ("1H",   d["h1"]),
-        ("2H",   d["h2"]),
-        ("4H",   d["h4"]),
-        ("Daily",d["d1"]),
-        ("Week", d["w1"]),
-    ]
-    results = []
-    for label, df in tfs:
-        t = tf_trend(df)
-        emoji = "🟢 Bull" if t == 1 else ("🔴 Bear" if t == -1 else "🟡 Side")
-        results.append((label, t, emoji))
- 
-    bull = sum(1 for _, t, _ in results if t ==  1)
-    bear = sum(1 for _, t, _ in results if t == -1)
-    neut = sum(1 for _, t, _ in results if t ==  0)
- 
-    if bull >= 6:   overall, overall_t = "🟢 STRONG BULLISH",  1
-    elif bull >= 4: overall, overall_t = "🟡 MILD BULLISH",    1
-    elif bear >= 6: overall, overall_t = "🔴 STRONG BEARISH", -1
-    elif bear >= 4: overall, overall_t = "🟠 MILD BEARISH",   -1
-    else:           overall, overall_t = "⚪ NEUTRAL",          0
- 
-    lines = [f"  {lbl:<6}: {em}" for lbl, _, em in results]
-    return "\n".join(lines), overall, overall_t, bull, bear, neut
- 
-# ── HIGH-ACCURACY SIGNAL ENGINE ──────────────────────────────────────────────
-def generate_signal(d, pvt, overall_trend):
-    """
-    New signal engine — 8 confluence factors:
-    1. Multi-TF trend alignment
-    2. RSI level + direction
-    3. Price vs key levels (PP, prev high/low)
-    4. MACD histogram direction
-    5. Bollinger band position
-    6. Volume confirmation
-    7. Market structure (HH/HL vs LH/LL)
-    8. ATR-based SL/TP with minimum R:R gate
-    """
-    price = d["price"]
-    pvt_pp, pvt_r1, pvt_s1 = pvt["PP"], pvt["R1"], pvt["S1"]
- 
-    # ── RSI (1H) ──
-    rsi_1h  = calc_rsi(d["h1"])
-    rsi_15m = calc_rsi(d["m15"])
- 
-    # ── MACD (1H) ──
-    macd_val, macd_sig, macd_hist = calc_macd(d["h1"])
- 
-    # ── Bollinger Bands (1H) ──
-    bb_upper, bb_mid, bb_lower = calc_bbands(d["h1"])
- 
-    # ── Volume ──
-    vol_r = vol_ratio(d["h1"])
- 
-    # ── Structure (4H) ──
-    structure = detect_structure(d["h4"])
- 
-    # ── ATR for SL/TP ──
-    atr_1h = calc_atr(d["h1"])
-    atr_4h = calc_atr(d["h4"])
-    atr    = atr_1h if atr_1h else (atr_4h if atr_4h else 10.0)
- 
-    # ── SCORING SYSTEM (max +10 / min -10) ──
-    score = 0
-    reasons_bull = []
-    reasons_bear = []
- 
-    # 1. Multi-TF trend (most important) — ±3
-    if overall_trend == 1:
-        score += 3
-        reasons_bull.append("Multi-TF Bullish alignment")
-    elif overall_trend == -1:
-        score -= 3
-        reasons_bear.append("Multi-TF Bearish alignment")
- 
-    # 2. RSI ±2
-    if rsi_1h < 30:
-        score += 2
-        reasons_bull.append(f"RSI oversold ({rsi_1h})")
-    elif rsi_1h > 70:
-        score -= 2
-        reasons_bear.append(f"RSI overbought ({rsi_1h})")
-    elif rsi_1h > 55 and overall_trend == 1:
-        score += 1
-        reasons_bull.append(f"RSI momentum bullish ({rsi_1h})")
-    elif rsi_1h < 45 and overall_trend == -1:
-        score -= 1
-        reasons_bear.append(f"RSI momentum bearish ({rsi_1h})")
- 
-    # 3. Price vs key levels ±2
-    if price > d["prev_h"]:
-        score += 2
-        reasons_bull.append("Price above Prev Day High (breakout)")
-    elif price < d["prev_l"]:
-        score -= 2
-        reasons_bear.append("Price below Prev Day Low (breakdown)")
-    elif price > pvt_pp:
-        score += 1
-        reasons_bull.append("Price above Pivot PP")
-    elif price < pvt_pp:
-        score -= 1
-        reasons_bear.append("Price below Pivot PP")
- 
-    # 4. MACD ±1
-    if macd_hist is not None:
-        if macd_hist > 0 and macd_val > macd_sig:
-            score += 1
-            reasons_bull.append("MACD bullish crossover")
-        elif macd_hist < 0 and macd_val < macd_sig:
-            score -= 1
-            reasons_bear.append("MACD bearish crossover")
- 
-    # 5. Bollinger Bands ±1
-    if bb_lower is not None and bb_upper is not None:
-        if price <= bb_lower:
-            score += 1
-            reasons_bull.append("Price at/below BB lower (bounce zone)")
-        elif price >= bb_upper:
-            score -= 1
-            reasons_bear.append("Price at/above BB upper (reversal risk)")
- 
-    # 6. Volume ±1
-    if vol_r >= 1.5:
-        if overall_trend == 1:
-            score += 1
-            reasons_bull.append(f"Volume spike ({vol_r}x avg) — confirms bulls")
-        elif overall_trend == -1:
-            score -= 1
-            reasons_bear.append(f"Volume spike ({vol_r}x avg) — confirms bears")
- 
-    # 7. Market structure ±1
-    if "HH/HL" in structure:
-        score += 1
-        reasons_bull.append("Bullish market structure (HH/HL)")
-    elif "LH/LL" in structure:
-        score -= 1
-        reasons_bear.append("Bearish market structure (LH/LL)")
- 
-    # ── DETERMINE DIRECTION ──
-    # Thresholds: Bull ≥ 5, Bear ≤ -4, else NEUTRAL
-    if score >= 5:
-        direction = "🟢 BUY"
-        bias      = 1
-    elif score <= -4:
-        direction = "🔴 SELL"
-        bias      = -1
+    pc,pr=d["prev_c"],d["price"]
+    tfs=[("1H",d["h1"]),("4H",d["h4"]),("15m",d["m15"]),("5m",d["m5"]),("1D",d["d1"])]
+    res={}
+    for l,df in tfs: res[l]=trend(df,pr,pc)
+    bull=sum(1 for v in res.values() if "Bull" in v)
+    bear=sum(1 for v in res.values() if "Bear" in v)
+    ov="🟢 BULLISH" if bull>bear else ("🔴 BEARISH" if bear>bull else "🟡 NEUTRAL")
+    return res,ov,bull,bear
+
+# ── BALANCED SIGNAL SCORING (6 factors, threshold=3) ─────────────────────────
+def get_signal(d, pvt, trends, overall, bull_c, bear_c):
+    price   = d["price"]
+    atr     = atr_val(d["m5"])
+    r1_rsi  = rsi_val(d["h1"])
+    r5_rsi  = rsi_val(d["m5"])
+    macd_txt, macd_h = macd_signal(d["m5"])
+    bb_pos, bb_lo, bb_mid, bb_hi = bollinger_pos(d["m5"])
+    stoch   = stoch_rsi_val(d["m5"])
+    struct_txt, struct_score = market_structure(d["h1"])
+    bull_ob, bear_ob = find_ob(d["m5"])
+    pp=pvt["PP"]; r1=pvt["R1"]; s1=pvt["S1"]
+
+    score=0; bull_r=[]; bear_r=[]
+
+    # ── FACTOR 1: HTF Trend (most important — 2 pts) ──────────────────────────
+    if "Bull" in trends.get("4H","") or "Bull" in trends.get("1D",""):
+        score+=2; bull_r.append("✅ HTF bullish (4H/1D)")
+    elif "Bear" in trends.get("4H","") and "Bear" in trends.get("1D",""):
+        score-=2; bear_r.append("❌ HTF bearish (4H/1D)")
+
+    # ── FACTOR 2: Price vs Pivot ───────────────────────────────────────────────
+    if price>pp:
+        score+=1; bull_r.append(f"✅ Above PP ${pp:,.2f}")
     else:
-        direction = "⚪ NEUTRAL"
-        bias      = 0
- 
-    # ── ATR-BASED SL/TP ──
-    if bias == 1:
-        entry = price
-        sl    = round(price - atr * ATR_SL_MULT, 2)
-        tp    = round(price + atr * ATR_TP_MULT,  2)
-        # Also check pivot support
-        if pvt_s1 > sl:
-            sl = round(pvt_s1 - 2, 2)   # SL just below S1
-    elif bias == -1:
-        entry = price
-        sl    = round(price + atr * ATR_SL_MULT, 2)
-        tp    = round(price - atr * ATR_TP_MULT,  2)
-        if pvt_r1 < sl:
-            sl = round(pvt_r1 + 2, 2)   # SL just above R1
+        score-=1; bear_r.append(f"❌ Below PP ${pp:,.2f}")
+
+    # ── FACTOR 3: RSI 1H ──────────────────────────────────────────────────────
+    if r1_rsi<35:
+        score+=1; bull_r.append(f"✅ RSI 1H oversold ({r1_rsi}) — bounce zone")
+    elif r1_rsi>65:
+        score-=1; bear_r.append(f"❌ RSI 1H overbought ({r1_rsi})")
+
+    # ── FACTOR 4: MACD 5m ─────────────────────────────────────────────────────
+    if "Bull" in macd_txt:
+        score+=1; bull_r.append(f"✅ MACD {macd_txt}")
+    elif "Bear" in macd_txt:
+        score-=1; bear_r.append(f"❌ MACD {macd_txt}")
+
+    # ── FACTOR 5: Bollinger / StochRSI ────────────────────────────────────────
+    if "Below lower" in bb_pos or stoch<25:
+        score+=1; bull_r.append(f"✅ Oversold: {bb_pos} | StochRSI:{stoch}")
+    elif "Above upper" in bb_pos or stoch>75:
+        score-=1; bear_r.append(f"❌ Overbought: {bb_pos} | StochRSI:{stoch}")
+
+    # ── FACTOR 6: Market Structure ────────────────────────────────────────────
+    if struct_score==1:
+        score+=1; bull_r.append(f"✅ {struct_txt}")
+    elif struct_score==-1:
+        score-=1; bear_r.append(f"❌ {struct_txt}")
+
+    # ── ATR BASED SL/TP ───────────────────────────────────────────────────────
+    sl_dist = max(atr*1.2, 8)
+    tp_dist = max(atr*2.0, 15)
+
+    # ── DECISION (threshold: +3 buy, -3 sell) ─────────────────────────────────
+    if score>=3:
+        dirn="🟢 BUY"; strength="STRONG" if score>=5 else "MODERATE"
+        entry=round(price,2)
+        sl=round(price-sl_dist,2)
+        tp1=round(price+tp_dist,2)
+        tp2=round(r1,2)
+        conf=min(90, 55+score*6)
+    elif score<=-3:
+        dirn="🔴 SELL"; strength="STRONG" if score<=-5 else "MODERATE"
+        entry=round(price,2)
+        sl=round(price+sl_dist,2)
+        tp1=round(price-tp_dist,2)
+        tp2=round(s1,2)
+        conf=min(90, 55+abs(score)*6)
+    elif score>=1:
+        dirn="🟡 WEAK BUY"; strength="WEAK"
+        entry=round(price,2)
+        sl=round(price-sl_dist,2)
+        tp1=round(price+tp_dist,2)
+        tp2=round(r1,2)
+        conf=40+score*5
+    elif score<=-1:
+        dirn="🟡 WEAK SELL"; strength="WEAK"
+        entry=round(price,2)
+        sl=round(price+sl_dist,2)
+        tp1=round(price-tp_dist,2)
+        tp2=round(s1,2)
+        conf=40+abs(score)*5
     else:
-        entry = price
-        sl    = round(pvt_s1, 2)
-        tp    = round(pvt_r1, 2)
- 
-    risk   = round(abs(entry - sl),   2)
-    reward = round(abs(tp   - entry), 2)
-    rr     = round(reward / risk, 2) if risk > 0 else 0
- 
-    # ── R:R GATE — if RR < 1.5, downgrade to NEUTRAL ──
-    if bias != 0 and rr < MIN_RR:
-        direction   = "⚪ NEUTRAL"
-        bias        = 0
-        gate_reason = f"⚠️ R:R {rr} < {MIN_RR} min — Signal filtered out"
-    else:
-        gate_reason = None
- 
-    # ── CONFIDENCE LABEL ──
-    abs_score = abs(score)
-    if abs_score >= 7:   confidence = "🔥 VERY HIGH (7+/10)"
-    elif abs_score >= 5: confidence = "✅ HIGH (5-6/10)"
-    elif abs_score >= 3: confidence = "🟡 MEDIUM (3-4/10)"
-    else:                confidence = "⚠️ LOW (0-2/10) — Skip"
- 
-    reasons = reasons_bull if bias >= 0 else reasons_bear
- 
+        dirn="⚪ NO TRADE"; strength="WAIT"
+        entry=price; sl=round(price-sl_dist,2)
+        tp1=round(price+tp_dist,2); tp2=round(r1,2)
+        conf=30
+
+    risk=round(abs(entry-sl),2); rew=round(abs(tp1-entry),2)
+    rr=round(rew/risk,2) if risk>0 else 0
+    all_reasons = bull_r+bear_r
+
     return dict(
-        direction  = direction,
-        bias       = bias,
-        entry      = entry,
-        sl         = sl,
-        tp         = tp,
-        rr         = rr,
-        score      = score,
-        confidence = confidence,
-        rsi_1h     = rsi_1h,
-        rsi_15m    = rsi_15m,
-        macd_hist  = macd_hist,
-        atr        = round(atr, 2),
-        structure  = structure,
-        vol_ratio  = vol_r,
-        reasons    = reasons,
-        gate_reason= gate_reason,
+        dirn=dirn,strength=strength,entry=entry,sl=sl,tp1=tp1,tp2=tp2,
+        rr=rr,score=score,conf=conf,
+        rsi_1h=r1_rsi,rsi_5m=r5_rsi,
+        macd_txt=macd_txt,macd_h=macd_h,
+        stoch=stoch,atr=atr,
+        bb_pos=bb_pos,bb_lo=bb_lo,bb_mid=bb_mid,bb_hi=bb_hi,
+        struct_txt=struct_txt,
+        bull_ob=bull_ob,bear_ob=bear_ob,
+        reasons=all_reasons
     )
- 
-# ── SESSIONS & KILL ZONES ────────────────────────────────────────────────────
-def sessions():
-    h = utc_h()
-    s_map  = {"Asia": (0, 8), "London": (7, 16), "New York": (12, 21)}
-    kz_map = {"Asia KZ": (0, 4), "London KZ": (6, 9), "NY KZ": (12, 15), "LC KZ": (15, 16)}
-    act_s  = [k for k, (a, b) in s_map.items()  if a <= h < b]
-    act_k  = [k for k, (a, b) in kz_map.items() if a <= h < b]
-    olap   = []
-    if 7  <= h < 8:  olap.append("Asia / London ⚡")
-    if 12 <= h < 16: olap.append("London / NY ⚡")
-    next_s = []
-    for name, (a, b) in s_map.items():
-        if h < a:
-            diff     = a - h
-            open_ist = (utcnow() + IST + datetime.timedelta(hours=diff)).strftime("%I:%M %p")
-            next_s.append(f"{name} opens at {open_ist} IST")
-    return act_s, act_k, olap, next_s
- 
-def session_quality(act_k, olap):
-    """High quality = in kill zone or overlap"""
-    if olap: return "🔥 PRIME TIME (Overlap)"
-    if act_k: return "✅ Kill Zone Active"
-    return "🟡 Normal Session"
- 
-# ── MOON PHASE ────────────────────────────────────────────────────────────────
-def moon():
-    m = ephem.Moon(); m.compute(datetime.date.today()); ph = float(m.phase)
-    name = ("🌑 New Moon" if ph < 6 else "🌒 Waxing Crescent" if ph < 25
-            else "🌓 First Quarter" if ph < 35 else "🌔 Waxing Gibbous" if ph < 60
-            else "🌕 Full Moon" if ph < 66 else "🌖 Waning Gibbous" if ph < 75
-            else "🌗 Last Quarter" if ph < 85 else "🌘 Waning Crescent")
-    return name, round(ph, 1)
- 
-# ── NEWS CALENDAR ────────────────────────────────────────────────────────────
-def news_today():
+
+# ── DXY ───────────────────────────────────────────────────────────────────────
+def get_dxy():
     try:
-        data  = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=10).json()
-        today = datetime.date.today().strftime("%Y-%m-%d")
-        items = [e for e in data if e.get("impact") in ("High", "Medium")
-                 and e.get("currency") == "USD" and e.get("date", "")[:10] == today]
-        if not items: return "  Aaj koi major USD news nahi."
-        out = []
+        h=yf.Ticker("DX-Y.NYB").history(period="3d",interval="1h")
+        if h.empty: return None
+        price=round(float(h["Close"].iloc[-1]),2)
+        chg=round(price-float(h["Close"].iloc[-2]),2)
+        r=rsi_val(h)
+        if chg>0.15:   sent="📈 Rising — Bearish for Gold"
+        elif chg<-0.15:sent="📉 Falling — Bullish for Gold"
+        else:          sent="➡️ Flat — Neutral"
+        return dict(price=price,chg=chg,rsi=r,sent=sent)
+    except: return None
+
+# ── SESSIONS ──────────────────────────────────────────────────────────────────
+def get_sessions():
+    h=utc_h()
+    s_map ={"Asia":(0,8),"London":(7,16),"New York":(12,21)}
+    kz_map={"Asia KZ":(0,4),"London KZ":(6,9),"NY KZ":(12,15),"LC KZ":(15,16)}
+    act_s=[k for k,(a,b) in s_map.items()  if a<=h<b]
+    act_k=[k for k,(a,b) in kz_map.items() if a<=h<b]
+    olap=[]
+    if 7<=h<8:   olap.append("Asia/London ⚡")
+    if 12<=h<16: olap.append("London/NY ⚡ BEST TIME")
+    best=len(act_k)>0 or len(olap)>0
+    # Next opens
+    next_opens=[]
+    opens_utc={"London":7,"New York":12,"Asia":0}
+    for name,oh in opens_utc.items():
+        if h<oh:
+            diff=oh-h
+            t=(utcnow()+IST+datetime.timedelta(hours=diff)).strftime("%I:%M %p")
+            next_opens.append(f"{name} opens {t} IST")
+    return act_s,act_k,olap,best,next_opens
+
+# ── MOON ──────────────────────────────────────────────────────────────────────
+def get_moon():
+    m=ephem.Moon(); m.compute(datetime.date.today()); ph=float(m.phase)
+    # Correct phase name
+    cycle=(datetime.date.today()-datetime.date(2000,1,6)).days % 29.53
+    cyc_pct=cycle/29.53
+    if cyc_pct<0.03 or cyc_pct>0.97: name="🌑 New Moon"
+    elif cyc_pct<0.25: name="🌒 Waxing Crescent"
+    elif cyc_pct<0.27: name="🌓 First Quarter"
+    elif cyc_pct<0.48: name="🌔 Waxing Gibbous"
+    elif cyc_pct<0.52: name="🌕 Full Moon"
+    elif cyc_pct<0.75: name="🌖 Waning Gibbous"
+    elif cyc_pct<0.77: name="🌗 Last Quarter"
+    else: name="🌘 Waning Crescent"
+    days_to_full=int((0.5-cyc_pct)*29.53) if cyc_pct<0.5 else int((1.5-cyc_pct)*29.53)
+    return name, round(ph,1), days_to_full
+
+# ── NEWS ──────────────────────────────────────────────────────────────────────
+def get_news(week=False):
+    try:
+        data=requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json",timeout=10).json()
+        today=datetime.date.today().strftime("%Y-%m-%d")
+        if week:
+            items=[e for e in data if e.get("impact")=="High" and e.get("currency")=="USD"]
+        else:
+            items=[e for e in data if e.get("impact") in ("High","Medium")
+                   and e.get("currency")=="USD" and e.get("date","")[:10]==today]
+        if not items:
+            return "  ✅ No major USD news — Clean technical day" if not week else "  No high-impact events this week"
+        out=[]
         for e in items[:8]:
-            raw = e.get("date", "")
+            raw=e.get("date","")
             try:
-                hh, mm = int(raw[11:13]), int(raw[14:16])
-                ist_t  = (datetime.datetime(2000, 1, 1, hh, mm) + IST).strftime("%I:%M %p")
-            except: ist_t = "?"
-            imp  = "🔴 HIGH" if e["impact"] == "High" else "🟡 MED"
-            fc   = e.get("forecast", "") or "-"
-            prev = e.get("previous", "") or "-"
-            out.append(f"  {imp} {ist_t} IST — {e['title']}\n    Forecast:{fc} | Prev:{prev}")
+                hh,mm=int(raw[11:13]),int(raw[14:16])
+                ist_t=(datetime.datetime(2000,1,1,hh,mm)+IST).strftime("%I:%M %p")
+                if week:
+                    day=datetime.datetime.strptime(raw[:10],"%Y-%m-%d").strftime("%a %d")
+                    out.append(f"  🔴 {day} {ist_t} IST — {e['title']}")
+                else:
+                    fc=e.get("forecast","") or "-"
+                    out.append(f"  🔴 {ist_t} IST — {e['title']} | Fcst:{fc}")
+            except: pass
         return "\n".join(out)
-    except Exception as ex:
-        return f"  Error: {ex}"
- 
-def news_week():
-    try:
-        data  = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=10).json()
-        items = [e for e in data if e.get("impact") in ("High", "Medium") and e.get("currency") == "USD"]
-        if not items: return "  Is hafte koi major news nahi."
-        out = []
-        for e in items[:12]:
-            raw = e.get("date", "")
-            try:
-                day   = datetime.datetime.strptime(raw[:10], "%Y-%m-%d").strftime("%a %d %b")
-                hh, mm = int(raw[11:13]), int(raw[14:16])
-                ist_t  = (datetime.datetime(2000, 1, 1, hh, mm) + IST).strftime("%I:%M %p")
-            except: day = "?"; ist_t = "?"
-            imp = "🔴" if e["impact"] == "High" else "🟡"
-            out.append(f"  {imp} {day} {ist_t} — {e['title']}")
-        return "\n".join(out)
-    except Exception as ex:
-        return f"  Error: {ex}"
- 
-# ── SIGNAL ALERT (Short — sent every 30min) ──────────────────────────────────
-def signal_alert(d):
-    pvt                        = calc_pivots(d["prev_h"], d["prev_l"], d["prev_c"])
-    _, overall, overall_t, bull, bear, neut = all_trends(d)
-    sig                        = generate_signal(d, pvt, overall_t)
-    act_s, act_k, olap, _      = sessions()
-    sq                         = session_quality(act_k, olap)
-    rsi_txt                    = f"{sig['rsi_1h']} {'⬆' if sig['rsi_1h'] > 50 else '⬇'}"
- 
-    # Reasons block
-    reasons_block = ""
-    if sig["reasons"]:
-        reasons_block = "\n📋 <b>Confluence:</b>\n" + "\n".join(f"  • {r}" for r in sig["reasons"][:4])
- 
-    gate_block = f"\n⛔ {sig['gate_reason']}" if sig["gate_reason"] else ""
- 
-    return f"""
-⚡ <b>SCALPINGMEBOT:  SIGNAL ALERT</b>
-📅 {ist_str()}
-💰 XAU/USD: ${d['price']:,.2f}
- 
-{sig['direction']}  |  Confidence: {sig['confidence']}
-  Entry : ${sig['entry']:,.2f}
-  SL    : ${sig['sl']:,.2f}
-  TP    : ${sig['tp']:,.2f}
-  R:R   : 1 : {sig['rr']}
-  Score : {sig['score']:+d}/10
-  ATR   : ${sig['atr']:,.2f}
-{gate_block}
- 
-📊 Trend  : {bull}B / {bear}S / {neut}N  →  {overall}
-📈 Structure: {sig['structure']}
-📉 RSI(1H) : {rsi_txt}  |  RSI(15m): {sig['rsi_15m']}
-🕯️ MACD hist: {sig['macd_hist'] if sig['macd_hist'] is not None else '—'}
-📦 Vol ratio: {sig['vol_ratio']}x
-{reasons_block}
- 
-🌐 Sessions : {', '.join(act_s) if act_s else 'None'}
-🎯 Kill Zones: {', '.join(act_k) if act_k else 'None'}
-⚡ Overlap  : {', '.join(olap)  if olap  else 'None'}
-🏆 Quality  : {sq}
-""".strip()
- 
-# ── FULL ALERT ────────────────────────────────────────────────────────────────
+    except: return "  Error fetching news"
+
+# ── VOLATILITY SCANNER ────────────────────────────────────────────────────────
+def vol_scan():
+    results=[]
+    for name,sym in PAIRS.items():
+        if name=="DXY": continue
+        try:
+            h=yf.Ticker(sym).history(period="2d",interval="1h")
+            if h.empty or len(h)<3: continue
+            price=round(float(h["Close"].iloc[-1]),2)
+            chg=round((float(h["Close"].iloc[-1])-float(h["Close"].iloc[-2]))/float(h["Close"].iloc[-2])*100,2)
+            a=atr_val(h)
+            results.append((name,price,chg,a))
+        except: continue
+    results.sort(key=lambda x:abs(x[2]),reverse=True)
+    lines=[]
+    for name,price,chg,a in results[:5]:
+        arr="▲" if chg>=0 else "▼"
+        hot="🔥" if abs(chg)>0.5 else "⚡" if abs(chg)>0.2 else "➡️"
+        lines.append(f"  {hot} {name}: ${price:,} {arr}{abs(chg)}%")
+    return "\n".join(lines)
+
+# ── FULL HOURLY ALERT ─────────────────────────────────────────────────────────
 def full_alert(d):
-    chg  = round(d["price"] - d["prev_c"], 2)
-    pct  = round(chg / d["prev_c"] * 100, 2) if d["prev_c"] else 0
-    arr  = "▲" if chg >= 0 else "▼"
-    pvt  = calc_pivots(d["prev_h"], d["prev_l"], d["prev_c"])
-    trend_block, overall, overall_t, bull, bear, neut = all_trends(d)
-    sig  = generate_signal(d, pvt, overall_t)
-    act_s, act_k, olap, next_s = sessions()
-    sq   = session_quality(act_k, olap)
-    moon_name, moon_pct = moon()
-    n_today = news_today()
-    n_week  = news_week()
- 
-    reasons_block = "\n".join(f"  • {r}" for r in sig["reasons"][:5]) if sig["reasons"] else "  —"
-    gate_block    = f"\n⛔ {sig['gate_reason']}" if sig["gate_reason"] else ""
-    macd_str      = f"{sig['macd_hist']:+.2f}" if sig["macd_hist"] is not None else "—"
- 
-    return f"""
-🏅 <b>XAU/USD MEGA ALERT — v4</b>
+    price=d["price"]
+    chg=round(price-d["prev_c"],2)
+    pct=round(chg/d["prev_c"]*100,2) if d["prev_c"] else 0
+    arr="▲" if chg>=0 else "▼"
+
+    pvt=calc_pivots(d["prev_h"],d["prev_l"],d["prev_c"])
+    trends,overall,bull_c,bear_c=all_trends(d)
+    sig=get_signal(d,pvt,trends,overall,bull_c,bear_c)
+    act_s,act_k,olap,best,next_op=get_sessions()
+    moon_n,moon_p,dtf=get_moon()
+    dxy=get_dxy()
+    n_today=get_news()
+    n_week=get_news(week=True)
+    scan=vol_scan()
+    timing="🎯 BEST TIME — Trade now!" if best else "⏳ Wait for kill zone"
+    conf_bar="█"*int(sig['conf']//10)+"░"*(10-int(sig['conf']//10))
+
+    # Signal color
+    if "BUY" in sig['dirn'] and "WEAK" not in sig['dirn']:   sig_emoji="🚀"
+    elif "SELL" in sig['dirn'] and "WEAK" not in sig['dirn']: sig_emoji="🔻"
+    elif "WEAK" in sig['dirn']: sig_emoji="⚠️"
+    else: sig_emoji="⏸️"
+
+    msg=f"""
+🏆 <b>SCALPING PRO — HOURLY BRIEF</b>
 📅 {ist_str()}
- 
+{timing}
+
 ━━━━━━━━━━━━━━━━━━━━
-💰 <b>PRICE</b>: ${d['price']:,.2f}  {arr} {abs(chg)} ({abs(pct)}%)
+💰 <b>XAU/USD</b>: ${price:,.2f}  {arr}{abs(chg)} ({abs(pct)}%)
+📊 ATR(14): ${sig['atr']:,.1f} | Day range: ${d['day_h']-d['day_l']:,.1f}
+
 ━━━━━━━━━━━━━━━━━━━━
- 
+{sig_emoji} <b>SIGNAL: {sig['dirn']}</b>  [{sig['strength']}]
+  [{conf_bar}] {sig['conf']}% confidence
+  Score: {sig['score']}/6
+
+  📍 Entry : ${sig['entry']:,.2f}
+  🛑 SL    : ${sig['sl']:,.2f}  (${sig['atr']:.1f} ATR)
+  🎯 TP1   : ${sig['tp1']:,.2f}
+  🎯 TP2   : ${sig['tp2']:,.2f}
+  ⚖️ R:R   : 1 : {sig['rr']}
+
+━━━━━━━━━━━━━━━━━━━━
+🧠 <b>WHY THIS SIGNAL</b>
+"""+"\n".join(f"  {r}" for r in sig['reasons'])+f"""
+
+━━━━━━━━━━━━━━━━━━━━
+📐 <b>SMART MONEY</b>
+  Structure : {sig['struct_txt']}
+  Bull OB   : ${sig['bull_ob']:,.2f}""" + (f"\n  Bear OB   : ${sig['bear_ob']:,.2f}" if sig['bear_ob'] else "") + f"""
+
+━━━━━━━━━━━━━━━━━━━━
 📊 <b>KEY LEVELS</b>
-  Day   H: ${d['day_h']:,.2f}  L: ${d['day_l']:,.2f}
-  Prev  H: ${d['prev_h']:,.2f}  L: ${d['prev_l']:,.2f}
-  Week  H: ${d['week_h']:,.2f}  L: ${d['week_l']:,.2f}
-  Month H: ${d['month_h']:,.2f}  L: ${d['month_l']:,.2f}
- 
+  Day   H/L : ${d['day_h']:,.2f} / ${d['day_l']:,.2f}
+  Prev  H/L : ${d['prev_h']:,.2f} / ${d['prev_l']:,.2f}
+  Week  H/L : ${d['week_h']:,.2f} / ${d['week_l']:,.2f}
+  Month H/L : ${d['month_h']:,.2f} / ${d['month_l']:,.2f}
+
 ━━━━━━━━━━━━━━━━━━━━
-📐 <b>PIVOT POINTS</b>
-  🟢 R3: ${pvt['R3']:,.2f}
-  🟢 R2: ${pvt['R2']:,.2f}
-  🟢 R1: ${pvt['R1']:,.2f}
-  🔵 PP: ${pvt['PP']:,.2f}
-  🔴 S1: ${pvt['S1']:,.2f}
-  🔴 S2: ${pvt['S2']:,.2f}
-  🔴 S3: ${pvt['S3']:,.2f}
- 
+📐 <b>PIVOTS</b>
+  R3:${pvt['R3']:,.2f} R2:${pvt['R2']:,.2f} R1:${pvt['R1']:,.2f}
+  PP:${pvt['PP']:,.2f}
+  S1:${pvt['S1']:,.2f} S2:${pvt['S2']:,.2f} S3:${pvt['S3']:,.2f}
+
 ━━━━━━━━━━━━━━━━━━━━
-📈 <b>MULTI-TF TREND</b>  [{bull}B / {bear}S / {neut}N]
-{trend_block}
-  ─────────
-  Overall : {overall}
- 
-━━━━━━━━━━━━━━━━━━━━
-🏗️ <b>MARKET STRUCTURE (4H)</b>: {sig['structure']}
- 
+📈 <b>TRENDS</b>
+  5m :{trends.get('5m','?')}  15m:{trends.get('15m','?')}
+  1H :{trends.get('1H','?')}  4H :{trends.get('4H','?')}
+  1D :{trends.get('1D','?')}
+  ▶ Overall: {overall} ({bull_c} bull / {bear_c} bear)
+
 ━━━━━━━━━━━━━━━━━━━━
 📉 <b>INDICATORS</b>
-  RSI (1H)  : {sig['rsi_1h']}
-  RSI (15m) : {sig['rsi_15m']}
-  MACD hist : {macd_str}
-  ATR (1H)  : ${sig['atr']:,.2f}
-  Vol ratio : {sig['vol_ratio']}x
- 
+  RSI 1H  : {sig['rsi_1h']} {'🔴OB' if sig['rsi_1h']>70 else '🟢OS' if sig['rsi_1h']<30 else '⚪'}
+  RSI 5m  : {sig['rsi_5m']} {'🔴OB' if sig['rsi_5m']>70 else '🟢OS' if sig['rsi_5m']<30 else '⚪'}
+  MACD    : {sig['macd_txt']}
+  StochRSI: {sig['stoch']} {'🔴OB' if sig['stoch']>80 else '🟢OS' if sig['stoch']<20 else '⚪'}
+  BB      : {sig['bb_pos']}
+
 ━━━━━━━━━━━━━━━━━━━━
-🎯 <b>SIGNAL</b>
-  Direction  : {sig['direction']}
-  Confidence : {sig['confidence']}
-  Score      : {sig['score']:+d}/10
-  Entry      : ${sig['entry']:,.2f}
-  Stop Loss  : ${sig['sl']:,.2f}
-  Take Profit: ${sig['tp']:,.2f}
-  Risk:Reward: 1 : {sig['rr']}
-{gate_block}
- 
-📋 <b>Confluence Reasons:</b>
-{reasons_block}
- 
+💵 <b>DXY</b>: ${dxy['price'] if dxy else 'N/A'} | {dxy['sent'] if dxy else 'N/A'}
+
 ━━━━━━━━━━━━━━━━━━━━
 🌐 <b>SESSIONS</b>
-  Active    : {', '.join(act_s) if act_s else 'None'}
-  Kill Zones: {', '.join(act_k) if act_k else 'None'}
-  Overlap   : {', '.join(olap)  if olap  else 'None'}
-  Quality   : {sq}
-{('  ' + '\n  '.join(next_s)) if next_s else ''}
- 
+  Active: {', '.join(act_s) if act_s else 'None'}
+  Kill Z: {', '.join(act_k) if act_k else 'None'}
+  Overlap:{', '.join(olap)  if olap  else 'None'}
+  {chr(10).join(next_op) if next_op else ''}
+
+━━━━━━━━━━━━━━━━━━━━
+🔥 <b>HOT PAIRS RIGHT NOW</b>
+{scan}
+
 ━━━━━━━━━━━━━━━━━━━━
 📰 <b>TODAY'S NEWS</b>
 {n_today}
- 
-━━━━━━━━━━━━━━━━━━━━
-📅 <b>WEEKLY CALENDAR</b>
+
+📅 <b>WEEKLY EVENTS</b>
 {n_week}
- 
+
 ━━━━━━━━━━━━━━━━━━━━
-{moon_name}  {moon_pct}% illuminated
- 
-<i>XAU/USD Bot v4 | 8-Factor Confluence | ATR SL/TP | IST</i>
+{moon_n} | {moon_p}% | Full moon in {dtf} days
+
+⚠️ <i>Max 1-2% risk per trade. Signal is confluence-based, not guarantee.</i>
 """.strip()
- 
-# ── NEWS ALERT ────────────────────────────────────────────────────────────────
-def news_alert():
-    return f"""
-📰 <b>NEWS ALERT — TODAY (IST)</b>
-📅 {ist_str()}
- 
-<b>Aaj ke high-impact events:</b>
-{news_today()}
- 
-━━━━━━━━━━━━━━━━━━━━
-📅 <b>Is hafte ke events:</b>
-{news_week()}
-""".strip()
- 
-# ── SESSION ALERT ─────────────────────────────────────────────────────────────
-def session_alert_msg():
-    h       = utcnow().hour
-    opens   = {7: "🇬🇧 London OPEN",  12: "🇺🇸 New York OPEN",  0: "🌏 Asia OPEN"}
-    closes  = {16: "🇬🇧 London CLOSE", 21: "🇺🇸 NY CLOSE",       8: "🌏 Asia CLOSE"}
-    name    = opens.get(h) or closes.get(h) or "Session Update"
-    act_s, act_k, olap, next_s = sessions()
-    sq      = session_quality(act_k, olap)
-    return f"""
-🔔 <b>{name}</b>
-📅 {ist_str()}
- 
-Active    : {', '.join(act_s) if act_s else 'None'}
-Kill Zones: {', '.join(act_k) if act_k else 'None'}
-Overlap   : {', '.join(olap)  if olap  else 'None'}
-Quality   : {sq}
-{chr(10).join(next_s) if next_s else ''}
-""".strip()
- 
-# ── MAIN ─────────────────────────────────────────────────────────────────────
+    return msg
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
-    print(f"🚀 XAU/USD Bot v4 | {ALERT_MODE} | {ist_str()}")
- 
-    if ALERT_MODE == "session":
-        send_all(session_alert_msg())
+    print(f"🚀 Scalping Pro v5 | {ALERT_MODE} | {ist_str()}")
+
+    if ALERT_MODE=="session":
+        act_s,act_k,olap,best,next_op=get_sessions()
+        h=utcnow().hour
+        opens={7:"🇬🇧 London OPEN",12:"🇺🇸 NY OPEN",0:"🌏 Asia OPEN"}
+        closes={16:"🇬🇧 London CLOSE",21:"🇺🇸 NY CLOSE",8:"🌏 Asia CLOSE"}
+        name=opens.get(h) or closes.get(h) or "Session Update"
+        msg=f"🔔 <b>{name}</b>\n📅 {ist_str()}\n\nActive: {', '.join(act_s) if act_s else 'None'}\nKZ: {', '.join(act_k) if act_k else 'None'}\nOverlap: {', '.join(olap) if olap else 'None'}\n{'🎯 BEST TIME TO TRADE!' if best else ''}"
+        send_all(msg); return
+
+    if ALERT_MODE=="news":
+        send_all(f"📰 <b>NEWS ALERT</b>\n📅 {ist_str()}\n\n<b>Today:</b>\n{get_news()}\n\n<b>This Week:</b>\n{get_news(week=True)}")
         return
- 
-    if ALERT_MODE == "news":
-        send_all(news_alert())
-        return
- 
-    d = get_data()
+
+    d=get_data()
     if d is None:
-        send_all(f"⚠️ Data fetch failed.\n📅 {ist_str()}\nMarket band ho sakta hai.")
-        return
- 
-    msg = signal_alert(d) if ALERT_MODE == "signal" else full_alert(d)
+        send_all(f"⚠️ Data error\n📅 {ist_str()}"); return
+
+    # Always send full alert — har ghante
+    msg=full_alert(d)
     send_all(msg)
-    print(msg)
- 
-if __name__ == "__main__":
+    print("✅ Done")
+
+if __name__=="__main__":
     main()
- 
